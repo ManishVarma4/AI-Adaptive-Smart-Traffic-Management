@@ -7,7 +7,7 @@ Estimate traffic conditions using SUMO and TraCI simulation data.
 - Lane-wise vehicle count extraction
 - Lane occupancy, halting vehicle count, and mean speed
 - Prototype density classification: EMPTY, LOW, MEDIUM, HIGH
-- Reusable Python module: `density_module.py`
+- Reusable Python module: `density_module.py` 
 - CSV density report
 - Basic and heavy-traffic simulation tests
 
