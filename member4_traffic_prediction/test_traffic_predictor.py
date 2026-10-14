@@ -1,4 +1,4 @@
-
+```python
 import unittest
 
 from member4_traffic_prediction.traffic_predictor import TrafficPredictor
@@ -20,6 +20,17 @@ class TestTrafficPredictor(unittest.TestCase):
         second = predictor.predict()
         self.assertNotEqual(first, second)
 
+    def test_prediction(self):
+        predictor = TrafficPredictor()
+        for count in [8, 12, 15, 19, 22]:
+            predictor.update(count)
+        self.assertEqual(predictor.predict(), 18)
+
+    def test_empty_history(self):
+        predictor = TrafficPredictor()
+        with self.assertRaises(ValueError):
+            predictor.predict()
+
     def test_traffic_levels(self):
         predictor = TrafficPredictor()
         self.assertEqual(predictor.traffic_level(0), "LOW")
@@ -27,6 +38,10 @@ class TestTrafficPredictor(unittest.TestCase):
         self.assertEqual(predictor.traffic_level(10), "MEDIUM")
         self.assertEqual(predictor.traffic_level(24), "MEDIUM")
         self.assertEqual(predictor.traffic_level(25), "HIGH")
+
+    def test_high_traffic(self):
+        predictor = TrafficPredictor()
+        self.assertEqual(predictor.traffic_level(30), "HIGH")
 
     def test_invalid_inputs(self):
         predictor = TrafficPredictor()
@@ -44,3 +59,4 @@ class TestTrafficPredictor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+```
