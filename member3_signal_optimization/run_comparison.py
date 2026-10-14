@@ -1,18 +1,22 @@
-"""Run identical four-way traffic demand with fixed-time and adaptive signal timing."""
+
+"""Compare fixed-time and adaptive SUMO traffic signal controllers."""
 from __future__ import annotations
+
 import argparse
 import csv
 import os
-from pathlib import Path
+import subprocess
 import sys
+from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def configure_sumo_python() -> None:
+def configure_sumo_python():
     home = os.environ.get("SUMO_HOME")
     if home:
         tools = str(Path(home) / "tools")
@@ -21,143 +25,611 @@ def configure_sumo_python() -> None:
 
 
 configure_sumo_python()
+
 try:
     import traci
 except ImportError as exc:
     raise SystemExit(
-        "Cannot import TraCI. Install SUMO, set SUMO_HOME, and ensure SUMO_HOME/tools is on PYTHONPATH."
+        "Cannot import TraCI. Set SUMO_HOME and ensure "
+        "SUMO_HOME/tools is available."
     ) from exc
 
 from build_network import build_network, find_sumo_binary
-from signal_controller import adaptive_green_seconds, axis_demand, discover_signal_groups, make_state
+from signal_controller import (
+    APPROACH_EDGES,
+    APPROACH_ORDER,
+    approach_demand,
+    adaptive_green_seconds,
+    choose_next_approach,
+    discover_signal_groups,
+    make_state,
+)
 from member2_density_estimation.density_module import get_lane_density_report
+from member4_traffic_prediction.traffic_predictor import TrafficPredictor
 
-INBOUND_EDGES = {"inN", "inS", "inE", "inW"}
+
+DIRECTIONS = ("N", "S", "E", "W")
+INBOUND_EDGES = set(APPROACH_EDGES.values())
 
 
-def run_one(mode: str, net_file: Path, route_file: Path, duration_cap: int = 1250) -> dict:
-    sumo = find_sumo_binary("sumo")
-    cmd = [sumo, "-n", str(net_file), "-r", str(route_file),
-           "--no-step-log", "true", "--duration-log.disable", "true",
-           "--time-to-teleport", "-1", "--waiting-time-memory", "1000", "--seed", "42"]
-    label = f"member3_{mode}"
+def find_emergency_approaches(conn):
+    """Find emergency vehicles in the SUMO simulation."""
+    found = set()
+
+    for vehicle_id in conn.vehicle.getIDList():
+        try:
+            if conn.vehicle.getTypeID(vehicle_id) != "emergency":
+                continue
+
+            edge_id = conn.vehicle.getRoadID(vehicle_id)
+
+            for approach, inbound_edge in APPROACH_EDGES.items():
+                if edge_id == inbound_edge:
+                    found.add(approach)
+                    break
+        except Exception:
+            # A vehicle may temporarily be on an internal junction edge.
+            continue
+
+    return found
+
+
+def load_camera_data(csv_path):
+    """Load the prepared camera traffic-state CSV."""
+    if not csv_path or not Path(csv_path).is_file():
+        raise FileNotFoundError(
+            f"Camera CSV not found: {csv_path}\n"
+            "Run the camera pipeline and traffic-state preparation first."
+        )
+
+    snapshots = {}
+
+    with Path(csv_path).open(
+        "r", newline="", encoding="utf-8-sig"
+    ) as file:
+        reader = csv.DictReader(file)
+
+        required = {"timestamp_s"}
+        for direction in DIRECTIONS:
+            required.add(f"normal_count_{direction}")
+            required.add(f"emergency_count_{direction}")
+
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                f"Camera CSV missing columns: {sorted(missing)}"
+            )
+
+        for row in reader:
+            timestamp = float(row["timestamp_s"])
+            snapshot = {}
+
+            for direction in DIRECTIONS:
+                normal = int(float(row[f"normal_count_{direction}"]))
+                emergency = int(float(row[f"emergency_count_{direction}"]))
+
+                if normal < 0 or emergency < 0:
+                    raise ValueError("Vehicle counts cannot be negative.")
+
+                snapshot[direction] = {
+                    "normal": normal,
+                    "emergency": emergency,
+                    "total": normal + emergency,
+                }
+
+            if timestamp in snapshots:
+                raise ValueError(
+                    f"Duplicate timestamp {timestamp} in camera CSV."
+                )
+
+            snapshots[timestamp] = snapshot
+
+    if not snapshots:
+        raise ValueError("Camera CSV contains no snapshots.")
+
+    return sorted(snapshots.items())
+
+
+def get_camera_snapshot(snapshots, simulation_time):
+    """Return the latest camera snapshot at or before simulation time."""
+    eligible = [
+        snapshot
+        for timestamp, snapshot in snapshots
+        if timestamp <= simulation_time
+    ]
+
+    return eligible[-1] if eligible else None
+
+
+def camera_demand(snapshot, approach):
+    """Use detected vehicle count as a basic demand score."""
+    return float(snapshot[approach]["total"])
+
+
+def run_one(
+    mode,
+    net_file,
+    route_file,
+    duration_cap=1500,
+    gui=False,
+    source="sumo",
+    camera_csv=None,
+):
+    """Run one controller using SUMO measurements or camera replay."""
+
+    snapshots = load_camera_data(camera_csv) if source == "camera" else []
+
+    sumo = find_sumo_binary("sumo-gui" if gui else "sumo")
+
+    cmd = [
+        sumo,
+        "-n", str(net_file),
+        "-r", str(route_file),
+        "--no-step-log", "true",
+        "--duration-log.disable", "true",
+        "--time-to-teleport", "-1",
+        "--waiting-time-memory", "1000",
+        "--seed", "42",
+    ]
+
+    if gui:
+        cmd.extend(["--start", "--delay", "50"])
+
+    label = f"member3_{mode}_{source}"
     traci.start(cmd, label=label)
     conn = traci.getConnection(label)
+
     try:
         groups = discover_signal_groups(conn)
-        current_axis = "NS"
-        green_seconds = 30 if mode == "fixed" else 20
-        yellow_seconds, all_red_seconds = 3, 1
-        phase, phase_remaining = "green", green_seconds
-        conn.trafficlight.setRedYellowGreenState(groups.tls_id, make_state(groups, current_axis, "G"))
 
-        step_count = total_halting_per_step = total_waiting_vehicle_seconds = 0
-        arrived_count = departed_count = adaptive_decisions = 0
+        current_approach = "N"
+        green_seconds = 30 if mode == "fixed" else 20
+        yellow_seconds = 3
+        all_red_seconds = 1
+
+        phase = "green"
+        phase_remaining = green_seconds
+
+        conn.trafficlight.setRedYellowGreenState(
+            groups.tls_id,
+            make_state(groups, current_approach, "G"),
+        )
+
+        now = conn.simulation.getTime()
+        last_served = {a: now for a in APPROACH_ORDER}
+        last_served[current_approach] = now
+
+        step_count = 0
+        total_halting_per_step = 0
+        stopped_vehicle_steps = 0
+        arrived_count = 0
+        departed_count = 0
+
+        adaptive_decisions = 0
+        emergency_priority_decisions = 0
+        starvation_preventions = 0
+
+        previous_was_emergency = False
         green_log = []
 
-        while conn.simulation.getMinExpectedNumber() > 0 and step_count < duration_cap:
+        predictor = TrafficPredictor(history_size=5)
+        next_prediction_sample = 0.0
+        prediction_interval = 300.0
+
+        predicted_count = 0
+        predicted_level = "LOW"
+
+        while (
+            conn.simulation.getMinExpectedNumber() > 0
+            and step_count < duration_cap
+        ):
             conn.simulationStep()
             step_count += 1
             now = conn.simulation.getTime()
-            # Member 2's reusable module is the source of live lane density data.
+
+            # SUMO metrics remain available in both modes for evaluation.
             report = get_lane_density_report(conn)
-            inbound = [lane for lane in report if lane.rsplit("_", 1)[0] in INBOUND_EDGES]
-            total_halting_per_step += sum(int(report[lane]["halting"]) for lane in inbound)
-            vehicle_ids = conn.vehicle.getIDList()
-            total_waiting_vehicle_seconds += sum(
-                1 for vehicle_id in vehicle_ids if conn.vehicle.getSpeed(vehicle_id) < 0.1
+
+            inbound = [
+                lane for lane in report
+                if lane.rsplit("_", 1)[0] in INBOUND_EDGES
+            ]
+
+            total_halting_per_step += sum(
+                int(report[lane]["halting"]) for lane in inbound
             )
+
+            vehicle_ids = conn.vehicle.getIDList()
+            stopped_vehicle_steps += sum(
+                1 for vehicle_id in vehicle_ids
+                if conn.vehicle.getSpeed(vehicle_id) < 0.1
+            )
+
             arrived_count += len(conn.simulation.getArrivedIDList())
             departed_count += len(conn.simulation.getDepartedIDList())
 
+            # Camera mode replays recorded observations against SUMO time.
+            snapshot = (
+                get_camera_snapshot(snapshots, now)
+                if source == "camera"
+                else None
+            )
+
+            if source == "sumo":
+                observed_count = sum(
+                    int(report[lane]["vehicles"]) for lane in inbound
+                )
+            elif snapshot is not None:
+                observed_count = sum(
+                    snapshot[a]["total"] for a in DIRECTIONS
+                )
+            else:
+                observed_count = None
+
+            if (
+                observed_count is not None
+                and now >= next_prediction_sample
+            ):
+                predictor.update(observed_count)
+                predicted_count = predictor.predict()
+                predicted_level = predictor.traffic_level(predicted_count)
+                next_prediction_sample = now + prediction_interval
+
             phase_remaining -= 1
+
             if phase_remaining > 0:
                 continue
 
             if phase == "green":
                 conn.trafficlight.setRedYellowGreenState(
-                    groups.tls_id, make_state(groups, current_axis, "y")
+                    groups.tls_id,
+                    make_state(groups, current_approach, "y"),
                 )
-                phase, phase_remaining = "yellow", yellow_seconds
-            elif phase == "yellow":
-                conn.trafficlight.setRedYellowGreenState(groups.tls_id, "r" * groups.signal_count)
-                phase, phase_remaining = "all_red", all_red_seconds
-            else:
-                # Alternate axes to guarantee service to both directions; adapt green length.
-                current_axis = "EW" if current_axis == "NS" else "NS"
-                report = get_lane_density_report(conn)
-                if mode == "fixed":
-                    green_seconds = 30
-                else:
-                    green_seconds = adaptive_green_seconds(axis_demand(report, current_axis))
-                    adaptive_decisions += 1
-                green_log.append({
-                    "time_s": round(now, 1), "axis": current_axis, "green_s": green_seconds,
-                    "ns_demand": round(axis_demand(report, "NS"), 2),
-                    "ew_demand": round(axis_demand(report, "EW"), 2),
-                })
-                conn.trafficlight.setRedYellowGreenState(
-                    groups.tls_id, make_state(groups, current_axis, "G")
-                )
-                phase, phase_remaining = "green", green_seconds
+                phase = "yellow"
+                phase_remaining = yellow_seconds
+                continue
 
-        unfinished = conn.simulation.getMinExpectedNumber()
-        avg_queue = total_halting_per_step / max(step_count, 1)
-        avg_wait = total_waiting_vehicle_seconds / max(arrived_count, 1)
+            if phase == "yellow":
+                conn.trafficlight.setRedYellowGreenState(
+                    groups.tls_id,
+                    "r" * groups.signal_count,
+                )
+                phase = "all_red"
+                phase_remaining = all_red_seconds
+                continue
+
+            # All-red interval is over. Select the next approach.
+            report = get_lane_density_report(conn)
+            starvation_used = False
+            was_emergency = False
+            prediction_adjustment = 0
+
+            if source == "sumo":
+                emergency_approaches = find_emergency_approaches(conn)
+            elif snapshot is not None:
+                emergency_approaches = {
+                    a for a in DIRECTIONS
+                    if snapshot[a]["emergency"] > 0
+                }
+            else:
+                emergency_approaches = set()
+
+            if mode == "fixed":
+                # Preserve the original fixed-time cyclic baseline.
+                current_approach = APPROACH_ORDER[
+                    (APPROACH_ORDER.index(current_approach) + 1)
+                    % len(APPROACH_ORDER)
+                ]
+                green_seconds = 30
+
+            else:
+                overdue = {
+                    a for a in APPROACH_ORDER
+                    if now - last_served[a] >= 90.0
+                }
+
+                if source == "camera" and snapshot is not None:
+                    emergency_candidates = [
+                        a for a in APPROACH_ORDER
+                        if a in emergency_approaches
+                        and not (
+                            previous_was_emergency
+                            and a == current_approach
+                        )
+                    ]
+
+                    if emergency_candidates:
+                        current_approach = max(
+                            emergency_candidates,
+                            key=lambda a: camera_demand(snapshot, a),
+                        )
+                        was_emergency = True
+                    else:
+                        overdue_candidates = [
+                            a for a in APPROACH_ORDER if a in overdue
+                        ]
+                        candidates = (
+                            overdue_candidates
+                            if overdue_candidates
+                            else list(APPROACH_ORDER)
+                        )
+
+                        current_approach = max(
+                            candidates,
+                            key=lambda a: camera_demand(snapshot, a),
+                        )
+                        starvation_used = current_approach in overdue
+
+                    base_green = max(
+                        10,
+                        min(
+                            40,
+                            int(10 + camera_demand(snapshot, current_approach)),
+                        ),
+                    )
+
+                elif source == "camera":
+                    # No camera sample is available at this simulation time.
+                    current_approach = APPROACH_ORDER[
+                        (APPROACH_ORDER.index(current_approach) + 1)
+                        % len(APPROACH_ORDER)
+                    ]
+                    base_green = 20
+
+                else:
+                    current_approach, was_emergency = choose_next_approach(
+                        report,
+                        last_served,
+                        now,
+                        emergency_approaches,
+                        previous_was_emergency,
+                        max_red_wait=90.0,
+                    )
+
+                    starvation_used = (
+                        current_approach in overdue and not was_emergency
+                    )
+
+                    base_green = adaptive_green_seconds(
+                        approach_demand(report, current_approach)
+                    )
+
+                if was_emergency:
+                    emergency_priority_decisions += 1
+
+                if starvation_used:
+                    starvation_preventions += 1
+
+                prediction_adjustment = {
+                    "LOW": -2,
+                    "MEDIUM": 0,
+                    "HIGH": 2,
+                }[predicted_level]
+
+                green_seconds = max(
+                    10,
+                    min(40, base_green + prediction_adjustment),
+                )
+                adaptive_decisions += 1
+
+            previous_was_emergency = was_emergency
+            last_served[current_approach] = now
+
+            if source == "camera" and snapshot is not None:
+                demand = camera_demand(snapshot, current_approach)
+            else:
+                demand = approach_demand(report, current_approach)
+
+            green_log.append({
+                "time_s": round(now, 1),
+                "approach": current_approach,
+                "green_s": green_seconds,
+                "approach_demand": round(demand, 2),
+                "predicted_count": (
+                    predicted_count if mode == "adaptive" else ""
+                ),
+                "predicted_level": (
+                    predicted_level if mode == "adaptive" else ""
+                ),
+                "prediction_adjustment_s": (
+                    prediction_adjustment if mode == "adaptive" else ""
+                ),
+                "emergency_present": int(
+                    current_approach in emergency_approaches
+                ),
+                "emergency_priority_used": int(was_emergency),
+                "starvation_prevention_used": int(starvation_used),
+                "source": source,
+            })
+
+            conn.trafficlight.setRedYellowGreenState(
+                groups.tls_id,
+                make_state(groups, current_approach, "G"),
+            )
+            phase = "green"
+            phase_remaining = green_seconds
+
         return {
             "controller": mode,
+            "source": source,
             "simulation_seconds": round(conn.simulation.getTime(), 1),
             "steps": step_count,
             "vehicles_departed": departed_count,
             "vehicles_arrived": arrived_count,
-            "unfinished_expected": unfinished,
-            "avg_inbound_queue_vehicles": round(avg_queue, 3),
-            "estimated_waiting_seconds_per_arrived_vehicle": round(avg_wait, 3),
+            "unfinished_expected": conn.simulation.getMinExpectedNumber(),
+            "avg_inbound_queue_vehicles": round(
+                total_halting_per_step / max(step_count, 1), 3
+            ),
+            "estimated_stopped_vehicle_steps_per_arrival": round(
+                stopped_vehicle_steps / max(arrived_count, 1), 3
+            ),
             "adaptive_green_decisions": adaptive_decisions,
+            "emergency_priority_decisions": emergency_priority_decisions,
+            "starvation_prevention_decisions": starvation_preventions,
             "green_log": green_log,
         }
+
     finally:
         conn.close()
 
 
-def write_outputs(results: list[dict]) -> None:
+def write_outputs(results):
+    if not results:
+        print("No results to write.")
+        return
+
     metrics_path = HERE / "comparison_results.csv"
-    keys = [key for key in results[0] if key != "green_log"]
-    with metrics_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=keys)
+    metric_fields = [
+        key for key in results[0] if key != "green_log"
+    ]
+
+    with metrics_path.open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=metric_fields)
         writer.writeheader()
         for result in results:
-            writer.writerow({key: result[key] for key in keys})
+            writer.writerow({
+                key: result[key] for key in metric_fields
+            })
 
     log_path = HERE / "green_decisions.csv"
-    fields = ["controller", "time_s", "axis", "green_s", "ns_demand", "ew_demand"]
-    with log_path.open("w", newline="", encoding="utf-8") as file:
+    fields = [
+        "controller",
+        "source",
+        "time_s",
+        "approach",
+        "green_s",
+        "approach_demand",
+        "predicted_count",
+        "predicted_level",
+        "prediction_adjustment_s",
+        "emergency_present",
+        "emergency_priority_used",
+        "starvation_prevention_used",
+    ]
+
+    with log_path.open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
+
         for result in results:
             for item in result["green_log"]:
-                writer.writerow({"controller": result["controller"], **item})
+                writer.writerow({
+                    "controller": result["controller"],
+                    **item,
+                })
+
     print(f"\nMetrics saved to: {metrics_path}")
     print(f"Green decisions saved to: {log_path}")
 
 
-def main() -> None:
+def choose_source():
+    """Show the startup menu and return the selected input source."""
+    print("\n" + "=" * 48)
+    print(" AI ADAPTIVE SMART TRAFFIC MANAGEMENT")
+    print("=" * 48)
+    print("Choose traffic input mode:\n")
+    print("A) SUMO Simulation")
+    print("B) Camera Video Replay")
+    print("=" * 48)
+
+    while True:
+        choice = input("Enter your choice (A/B): ").strip().upper()
+
+        if choice == "A":
+            print("\nSelected: SUMO Simulation")
+            return "sumo"
+
+        if choice == "B":
+            print("\nSelected: Camera Video Replay")
+            return "camera"
+
+        print("Invalid choice. Please enter A or B.")
+
+
+def prepare_camera_data():
+    """Run the detection and CSV preparation scripts for camera mode."""
+    member1_dir = ROOT / "member1_vehicle_detection"
+    detection_script = member1_dir / "camera_traffic_pipeline.py"
+    preparation_script = member1_dir / "prepare_traffic_state.py"
+
+    for script in (detection_script, preparation_script):
+        if not script.is_file():
+            raise FileNotFoundError(f"Required script not found: {script}")
+
+    print("\nStep 1/2: Processing the four camera videos...")
+    subprocess.run(
+        [sys.executable, str(detection_script)],
+        cwd=str(ROOT),
+        check=True,
+    )
+
+    print("\nStep 2/2: Preparing traffic-state CSV...")
+    subprocess.run(
+        [sys.executable, str(preparation_script)],
+        cwd=str(ROOT),
+        check=True,
+    )
+
+    camera_csv = (
+        member1_dir / "output" / "traffic_state_by_timestamp.csv"
+    )
+
+    if not camera_csv.is_file():
+        raise FileNotFoundError(
+            f"Prepared camera CSV was not created: {camera_csv}"
+        )
+
+    return camera_csv
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--duration-cap", type=int, default=1250,
-                        help="Safety cap in simulation seconds (default: 1250)")
+    parser.add_argument("--duration-cap", type=int, default=1500)
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Show the SUMO GUI",
+    )
     args = parser.parse_args()
+
+    source = choose_source()
+    camera_csv = prepare_camera_data() if source == "camera" else None
+
     net_file, route_file = build_network()
     results = []
+
     for mode in ("fixed", "adaptive"):
-        print(f"\nRunning {mode.upper()} controller on identical demand...")
-        result = run_one(mode, net_file, route_file, args.duration_cap)
+        print(
+            f"\nRunning {mode.upper()} controller "
+            f"with source={source}..."
+        )
+
+        result = run_one(
+            mode,
+            net_file,
+            route_file,
+            duration_cap=args.duration_cap,
+            gui=args.gui,
+            source=source,
+            camera_csv=camera_csv,
+        )
         results.append(result)
+
         for key, value in result.items():
             if key != "green_log":
                 print(f"  {key}: {value}")
+
     write_outputs(results)
-    print("\nCompare queue and waiting metrics (lower is better) and vehicles_arrived (higher is better).")
-    print("Results are experimental; do not claim improvement until the generated CSVs confirm it.")
+
+    print("\nRun completed.")
+    print(f"Input mode: {source.upper()}")
+    print("Validate timing, emergency labels and signal safety.")
+    print("Camera mode replays recorded data in SUMO; it does not")
+    print("directly control real-world traffic signals.")
 
 
 if __name__ == "__main__":
