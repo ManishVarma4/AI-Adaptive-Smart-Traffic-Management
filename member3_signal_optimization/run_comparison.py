@@ -46,6 +46,7 @@ from signal_controller import (
 )
 from member2_density_estimation.density_module import get_lane_density_report
 from member4_traffic_prediction.traffic_predictor import TrafficPredictor
+from dashboard import start_dashboard, update_dashboard
 
 
 DIRECTIONS = ("N", "S", "E", "W")
@@ -154,6 +155,7 @@ def run_one(
     gui=False,
     source="sumo",
     camera_csv=None,
+    seed=42,
 ):
     """Run one controller using SUMO measurements or camera replay."""
 
@@ -169,10 +171,20 @@ def run_one(
         "--duration-log.disable", "true",
         "--time-to-teleport", "-1",
         "--waiting-time-memory", "1000",
-        "--seed", "42",
+        "--seed", str(seed),
     ]
 
     if gui:
+        view_settings = HERE / "sumo_viewsetting.xml"
+
+        if view_settings.is_file():
+            cmd.extend([
+                "--gui-settings-file",
+                str(view_settings)
+            ])
+        else:
+            print(f"Warning: View settings not found: {view_settings}")
+
         cmd.extend(["--start", "--delay", "50"])
 
     label = f"member3_{mode}_{source}"
@@ -211,6 +223,8 @@ def run_one(
 
         previous_was_emergency = False
         green_log = []
+        dashboard_events = []
+        dashboard_history = []
 
         predictor = TrafficPredictor(history_size=5)
         next_prediction_sample = 0.0
@@ -274,6 +288,53 @@ def run_one(
                 predicted_count = predictor.predict()
                 predicted_level = predictor.traffic_level(predicted_count)
                 next_prediction_sample = now + prediction_interval
+
+            # Publish live measurements to the local browser dashboard.
+            direction_metrics = {}
+            for approach, label in zip(DIRECTIONS, ("NORTH", "SOUTH", "EAST", "WEST")):
+                edge_id = APPROACH_EDGES[approach]
+                lane_rows = [
+                    row for lane_id, row in report.items()
+                    if lane_id.rsplit("_", 1)[0] == edge_id
+                ]
+                sumo_vehicles = sum(int(row.get("vehicles", 0)) for row in lane_rows)
+                queue = sum(int(row.get("halting", 0)) for row in lane_rows)
+                if source == "camera" and snapshot is not None:
+                    visible_vehicles = int(snapshot[approach]["total"])
+                else:
+                    visible_vehicles = sumo_vehicles
+                signal = "RED"
+                if approach == current_approach:
+                    signal = "GREEN" if phase == "green" else ("YELLOW" if phase == "yellow" else "RED")
+                direction_metrics[label] = {
+                    "vehicles": visible_vehicles,
+                    "queue": queue,
+                    "signal": signal,
+                    "passed": 0,
+                }
+            dashboard_history.append({
+                "time_s": round(now, 1),
+                "queue": sum(item["queue"] for item in direction_metrics.values()),
+            })
+            update_dashboard({
+                "status": f"Running {mode} controller",
+                "controller": mode,
+                "source": source,
+                "time_s": round(now, 1),
+                "step": step_count,
+                "vehicles_passed": arrived_count,
+                "vehicles_departed": departed_count,
+                "vehicles_in_network": len(vehicle_ids),
+                "decision_count": adaptive_decisions if mode == "adaptive" else len(green_log),
+                "predicted_count": predicted_count,
+                "predicted_level": predicted_level,
+                "phase": phase,
+                "active_direction": current_approach,
+                "green_remaining": max(0, phase_remaining),
+                "directions": direction_metrics,
+                "events": dashboard_events[-100:],
+                "history": dashboard_history[-180:],
+            })
 
             phase_remaining -= 1
 
@@ -419,6 +480,42 @@ def run_one(
                 demand = camera_demand(snapshot, current_approach)
             else:
                 demand = approach_demand(report, current_approach)
+
+            decision_reason = []
+            if was_emergency:
+                decision_reason.append("Emergency priority")
+            if starvation_used:
+                decision_reason.append("Starvation prevention")
+            if prediction_adjustment:
+                decision_reason.append(f"Prediction {prediction_adjustment:+d}s")
+            if not decision_reason:
+                decision_reason.append("Demand-based" if mode == "adaptive" else "Fixed-time cycle")
+            dashboard_events.append({
+                "time_s": round(now, 1),
+                "approach": current_approach,
+                "green_s": green_seconds,
+                "demand": round(demand, 2),
+                "reason": ", ".join(decision_reason),
+            })
+            update_dashboard({
+                "status": f"Running {mode} controller",
+                "controller": mode,
+                "source": source,
+                "time_s": round(now, 1),
+                "step": step_count,
+                "vehicles_passed": arrived_count,
+                "vehicles_departed": departed_count,
+                "vehicles_in_network": len(conn.vehicle.getIDList()),
+                "decision_count": adaptive_decisions if mode == "adaptive" else len(green_log) + 1,
+                "predicted_count": predicted_count,
+                "predicted_level": predicted_level,
+                "phase": "green",
+                "active_direction": current_approach,
+                "green_remaining": green_seconds,
+                "directions": direction_metrics,
+                "events": dashboard_events[-100:],
+                "history": dashboard_history[-180:],
+            })
 
             green_log.append({
                 "time_s": round(now, 1),
@@ -589,12 +686,17 @@ def prepare_camera_data():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration-cap", type=int, default=1500)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--gui",
         action="store_true",
         help="Show the SUMO GUI",
     )
     args = parser.parse_args()
+
+    dashboard_url = start_dashboard(open_browser=True)
+    print(f"Live dashboard: {dashboard_url}")
+    update_dashboard({"status": "Dashboard open — waiting for input selection"})
 
     source = choose_source()
     camera_csv = prepare_camera_data() if source == "camera" else None
@@ -616,6 +718,7 @@ def main():
             gui=args.gui,
             source=source,
             camera_csv=camera_csv,
+            seed=args.seed,
         )
         results.append(result)
 
@@ -624,6 +727,7 @@ def main():
                 print(f"  {key}: {value}")
 
     write_outputs(results)
+    update_dashboard({"status": "Run completed", "controller": "Comparison complete"})
 
     print("\nRun completed.")
     print(f"Input mode: {source.upper()}")
